@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>221b — search jialin00.com</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #6b6b6b;
+    --line: #e5e5e5; --accent: #b3402a; --card: #fafafa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121212; --fg: #e8e8e8; --muted: #9a9a9a;
+      --line: #2c2c2c; --accent: #e06c50; --card: #1c1c1c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.6 -apple-system, "Helvetica Neue", "Noto Sans TC", sans-serif;
+  }
+  main { max-width: 680px; margin: 0 auto; padding: 48px 20px 96px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h1 a { color: inherit; text-decoration: none; }
+  .sub { color: var(--muted); font-size: 14px; margin: 0 0 28px; }
+  .searchbox { display: flex; gap: 8px; }
+  input[type="search"] {
+    flex: 1; font: inherit; color: inherit; background: var(--card);
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px;
+    outline: none;
+  }
+  input[type="search"]:focus { border-color: var(--accent); }
+  button {
+    font: inherit; padding: 10px 18px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--card); color: var(--fg);
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  #status { color: var(--muted); font-size: 13px; margin: 10px 2px; min-height: 1.2em; }
+  #results { margin-top: 18px; display: flex; flex-direction: column; gap: 14px; }
+  .hit {
+    border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
+    background: var(--card); position: relative;
+  }
+  .badge {
+    position: absolute; top: 12px; right: 12px;
+    font-size: 11px; line-height: 1; padding: 4px 8px; border-radius: 999px;
+    color: var(--accent); border: 1px solid var(--accent); opacity: .75;
+  }
+  .hit a.title { color: var(--accent); text-decoration: none; font-weight: 600; }
+  .hit a.title:hover { text-decoration: underline; }
+  .meta { color: var(--muted); font-size: 12.5px; margin: 2px 0 8px; }
+  .snippet { font-size: 14.5px; color: var(--fg); overflow-wrap: anywhere; }
+  .lowconf {
+    border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 10px 14px; font-size: 14px; color: var(--muted);
+  }
+  footer { margin-top: 48px; color: var(--muted); font-size: 12.5px; }
+  footer a { color: inherit; }
+</style>
+</head>
+<body>
+<main>
+  <h1><a href="https://jialin00.com">221b</a></h1>
+  <p class="sub">semantic search over jialin00.com — runs entirely in your browser, no server</p>
+
+  <div class="searchbox">
+    <input id="q" type="search" placeholder="loading model…" disabled
+           autocomplete="off" spellcheck="false">
+    <button id="go" disabled>Search</button>
+  </div>
+  <div id="status">fetching index…</div>
+  <div id="results"></div>
+
+  <footer>
+    index: <span id="idxinfo">…</span> · embedding runs locally via
+    <a href="https://huggingface.co/docs/transformers.js">transformers.js</a>
+    · nothing you type leaves this page
+  </footer>
+</main>
+
+<script type="module">
+import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.0";
+
+const $q = document.getElementById("q");
+const $go = document.getElementById("go");
+const $status = document.getElementById("status");
+const $results = document.getElementById("results");
+const $idxinfo = document.getElementById("idxinfo");
+
+// One card per article. The engine-side cap of 2 chunks exists so an LLM
+// reader gets context; on a results page the second chunk just reads as a
+// duplicate card (she caught this on the first live search).
+const PER_ARTICLE_CAP = 1;
+const TOP_K = 8;
+// e5 cosine floor, measured 2026-07-19 against this corpus: no-answer queries
+// top out at ~0.83, real hits start at ~0.861. No reranker here, so Chinese
+// queries against the mostly-English corpus can rank wrong even when relevant —
+// the hint below the box tells users to retry in English.
+const LOW_CONF = 0.845;
+
+let vectors, chunks, dim, count, extractor;
+
+function setStatus(t) { $status.textContent = t; }
+
+async function loadIndex() {
+  const manifest = await (await fetch("data/manifest.json")).json();
+  ({ dim, count } = manifest);
+  const [buf, cj] = await Promise.all([
+    (await fetch("data/vectors.bin")).arrayBuffer(),
+    (await fetch("data/chunks.json")).json(),
+  ]);
+  if (buf.byteLength !== count * dim * 4) {
+    throw new Error(`vectors.bin size mismatch: ${buf.byteLength} vs ${count * dim * 4}`);
+  }
+  vectors = new Float32Array(buf);
+  chunks = cj;
+  $idxinfo.textContent = `${count} chunks · ${manifest.model} · ${manifest.exported_at.slice(0, 10)}`;
+}
+
+async function loadModel() {
+  extractor = await pipeline("feature-extraction", "Xenova/multilingual-e5-small", {
+    dtype: "q8",
+    progress_callback: (p) => {
+      if (p.status === "progress" && p.file?.endsWith(".onnx")) {
+        setStatus(`downloading model… ${Math.round(p.progress)}% (one-time, cached after)`);
+      }
+    },
+  });
+}
+
+async function search(query) {
+  const out = await extractor("query: " + query, { pooling: "mean", normalize: true });
+  const q = out.data;
+  const scores = new Float32Array(count);
+  for (let i = 0; i < count; i++) {
+    let s = 0;
+    const off = i * dim;
+    for (let j = 0; j < dim; j++) s += q[j] * vectors[off + j];
+    scores[i] = s;
+  }
+  const order = [...scores.keys()].sort((a, b) => scores[b] - scores[a]);
+  const seen = {};
+  const hits = [];
+  for (const i of order) {
+    const slug = chunks[i].slug;
+    if ((seen[slug] || 0) >= PER_ARTICLE_CAP) continue;
+    seen[slug] = (seen[slug] || 0) + 1;
+    hits.push({ ...chunks[i], score: scores[i] });
+    if (hits.length >= TOP_K) break;
+  }
+  return hits;
+}
+
+function esc(s) {
+  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+// Fallback when an article has no frontmatter description: de-markdown the
+// matched chunk so table pipes, **bold**, [links](url) and mid-word cuts
+// don't leak onto the card.
+function plainText(md) {
+  return md
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/^#+\s*/gm, "")
+    .replace(/[*_]{1,3}([^*_]+)[*_]{1,3}/g, "$1")
+    .replace(/\|/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function render(hits) {
+  $results.innerHTML = "";
+  if (!hits.length) { $results.innerHTML = '<div class="lowconf">nothing indexed yet.</div>'; return; }
+  if (hits[0].score < LOW_CONF) {
+    const d = document.createElement("div");
+    d.className = "lowconf";
+    d.textContent = "low confidence — the blog may not cover this, or try rephrasing in English (the corpus is mostly English). Closest matches below.";
+    $results.appendChild(d);
+  }
+  for (const h of hits) {
+    const el = document.createElement("div");
+    el.className = "hit";
+    const date = h.date ? h.date.slice(0, 10) : "";
+    const snippet = h.description || plainText(h.text).slice(0, 200) + "…";
+    el.innerHTML =
+      (h.score < LOW_CONF ? '<span class="badge">low match</span>' : "") +
+      `<a class="title" href="https://jialin00.com/v2/${encodeURIComponent(h.slug)}">${esc(h.title)}</a>` +
+      `<div class="meta">${esc(date)}${date && h.tags ? " · " : ""}${esc(h.tags || "")} · ${h.score.toFixed(3)}</div>` +
+      `<div class="snippet">${esc(snippet)}</div>`;
+    $results.appendChild(el);
+  }
+}
+
+let modelLoading = null;
+
+async function run() {
+  const query = $q.value.trim();
+  if (!query) return;
+  $go.disabled = true;
+  try {
+    if (!extractor) {
+      // Model is fetched only when someone actually searches — a passerby
+      // costs 2.4MB of index, never the 120MB model.
+      modelLoading ??= loadModel();
+      setStatus("first search downloads the model (~120MB, one-time, cached in your browser)…");
+      await modelLoading;
+    }
+    setStatus("searching…");
+    const t0 = performance.now();
+    const hits = await search(query);
+    render(hits);
+    setStatus(`${(performance.now() - t0).toFixed(0)} ms`);
+  } catch (e) {
+    setStatus("search failed: " + e.message);
+  } finally {
+    $go.disabled = false;
+  }
+}
+
+$go.addEventListener("click", run);
+$q.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
+
+try {
+  setStatus("fetching index… (2.4MB)");
+  await loadIndex();
+  $q.disabled = false;
+  $go.disabled = false;
+  $q.placeholder = "ask the blog anything (English recalls best)";
+  $q.focus();
+  setStatus("ready — first search downloads a ~120MB model, cached after");
+} catch (e) {
+  setStatus("failed to initialize: " + e.message);
+}
+</script>
+</body>
+</html>
